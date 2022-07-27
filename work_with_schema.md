@@ -276,3 +276,101 @@ StructType([
 ])
 ```
 It's what we needed above to copy to our PySpark codes.
+
+## Too big schema? Split the schema
+
+It's good now to have a flow: json sample -> PySpark schema codes. However, when the schema is too big, we can hardly print the output. We can of course dump it into the storage and open it as file, but it's not handy.
+
+It came up to me the idea to split the schema into children. For this, I made some utils functions to first split the Json structure.
+
+```python
+def get_key_elem(root, json_key):
+  if json_key[-2:] == '[]':
+    return root[json_key[:-2]][0]
+  return root[json_key]
+
+def get_element(root, json_keys):
+  if len(json_keys) == 1:
+    return get_key_elem(root, json_keys[0])
+  return get_element(get_key_elem(root, json_keys[0]), json_keys[1:])
+
+def get_element_by_path(root, json_path):
+  return get_element(root, json_path.split('.'))
+
+def patch_element(root, json_keys):
+  def patch_key_elem(root, json_key):
+    if json_key[-2:] == '[]':
+      root[json_key[:-2]][0] = None
+    else:
+      root[json_key] = None
+    return root
+  
+  if len(json_keys) == 1:
+    return patch_key_elem(root, json_keys[0])
+  return patch_element(get_key_elem(root, json_keys[0]), json_keys[1:])
+```
+These help to get out children elements with Json paths and replace them with None value. With these, we can make a utils to hook, generate schemas for patched json structures.
+
+```python
+def gen_splitted_schemas(json_struct, splitted_paths, root_name='__root__'):
+  schemas = {}
+  for sch in sorted(splitted_paths, key=lambda x: 1.0/len(x[0].split('.'))):
+    nested = get_element_by_path(json_struct, sch[0])
+    patch_element(json_struct, sch[0].split('.'))
+    child_paths = [p for p in filter(lambda x: x[0].startswith(sch[0]), splitted_paths)]
+    hook_paths = {tuple(struct_path[0][len(sch[0])+1:].split('.')): struct_path[1] for struct_path in splitted_paths}
+    schemas[sch[1]] = pyspark_type(json.dumps(nested), hook_paths=hook_paths)
+
+  hook_paths = {tuple(struct_path[0].split('.')): struct_path[1] for struct_path in splitted_paths}
+  schemas[root_name] = pyspark_type(json.dumps(json_struct), hook_paths)
+  return schemas
+```
+
+Now, we can try to spit the above struct:
+
+```python
+test_json = """
+{
+  "test": [{
+    "field_a": "",
+    "field_b": true,
+    "field_c": 0,
+    "field_d": {
+      "nested_d":  [{
+        "d_a": "",
+        "d_b": true,
+        "d_c": 0,
+        "d_d": 0.1    
+      }]
+    }
+  }]
+}
+"""
+test_schemas = gen_splitted_schemas(json.loads(test_json), splitted_paths=[
+  ('test[].field_d.nested_d[]', 'schema1'),
+  ('test[].field_d', 'schema2')
+], root_name='test_schema')
+
+for schm in test_schemas:
+  print(f'{schm} = {test_schemas[schm]}')
+```
+Output:
+```
+schema1 = StructType([
+  StructField("d_a", StringType(), True),
+  StructField("d_b", BooleanType(), True),
+  StructField("d_c", LongType(), True),
+  StructField("d_d", DoubleType(), True)
+])
+schema2 = StructType([
+  StructField("nested_d", ArrayType(schema1, True), True)
+])
+test_schema = StructType([
+  StructField("test", ArrayType(StructType([
+    StructField("field_a", StringType(), True),
+    StructField("field_b", BooleanType(), True),
+    StructField("field_c", LongType(), True),
+    StructField("field_d", schema2, True)
+  ]), True), True)
+])
+```
