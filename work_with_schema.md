@@ -374,3 +374,263 @@ test_schema = StructType([
   ]), True), True)
 ])
 ```
+
+## Manage Schema as data dictionary
+
+So, with the above tools, we could easily create/test PySpark decoding schema if we have a complete Json data sample. We can make another step to make it more business-liked, rather than technical-liked.
+
+For business staffs, it's not usual to manage data definition as a Json message, like the above
+
+```json
+{
+  "test": [{
+    "field_a": "",
+    "field_b": true,
+    "field_c": 0,
+    "field_d": {
+      "nested_d":  [{
+        "d_a": "",
+        "d_b": true,
+        "d_c": 0,
+        "d_d": 0.1    
+      }]
+    }
+  }]
+}
+```
+and even bigger Json messages. It's easier for them to manage data schema as data dictionary. So, for data types of element data fields in the Json messages. For the above complete Json sample, it's comprehensive for them to define as a data dictionary of Json paths to data types like
+```
+'test[].field_a': 'string',
+'test[].field_b': 'boolean',
+'test[].field_c': 'integer',
+'test[].field_d.nested_d[].d_a': 'string',
+'test[].field_d.nested_d[].d_b': 'boolean',
+'test[].field_d.nested_d[].d_c': 'integer',
+'test[].field_d.nested_d[].d_d': 'double'
+```
+
+To provide this facility, we would make a utils too just generate the Json sample from the data dictionary
+
+```python
+import json
+
+def bad_key(key):
+  bad_chars = " ,;{}()\n\t="
+  for char in bad_chars:
+    if key.find(char) >= 0:
+      return True
+  return False  
+
+def add_element(root, json_key, value):
+  is_array = False
+  if json_key[-2:] == '[]':
+    is_array = True
+    json_key = json_key[:-2]
+  
+  if bad_key(json_key):
+    print('bad key', json_key)
+    raise ""
+  
+  if not json_key in root:
+    if is_array:
+      root[json_key] = [value]
+    else:
+      root[json_key] = value
+  if is_array:
+    return root, root[json_key][0]
+  return root, root[json_key]
+
+def enum_types():
+  return set([
+    'ENUM_0', 'ENUM_1'
+  ])
+
+def standard_type(data_type):
+  if data_type == 'decimal' or data_type == 'double':
+    return 'double'
+  elif data_type[:4] == 'bool':
+    return 'boolean'
+  elif data_type[:3] == 'int' or data_type == 'long' or data_type in enum_types():
+    return 'long'
+  elif data_type == 'string':
+    return 'string'
+  print('unknown', data_type)
+  raise ""
+
+def make_standard(schema):
+  return {json_path: standard_type(schema[json_path].lower()) for json_path in schema}
+
+def get_val_for_type(data_type):
+  if data_type is None:
+    return {}
+  elif data_type == 'double':
+    return 0.1
+  elif data_type == 'boolean':
+    return True
+  elif data_type == 'long':
+    return 0
+  elif data_type == 'string':
+    return ''
+  print('unknown', data_type)
+  raise ""
+
+def add_deep_element(root, json_path, data_type):
+  json_keys = json_path.split(".")
+  child = root
+  for key in json_keys[:-1]:
+    _, child = add_element(child, key, get_val_for_type(None))
+  _, child = add_element(child, json_keys[-1], get_val_for_type(data_type.lower()))
+  return root, child
+
+def create_sample(schema):
+  element = {}
+  schema = make_standard(schema)
+  for json_path in schema:
+    element, _ = add_deep_element(element, json_path, schema[json_path])
+  return element
+
+```
+
+with these utils, we can generate the complete Json sample
+
+```python
+test_dict = {
+  'test[].field_a': 'string',
+  'test[].field_b': 'boolean',
+  'test[].field_c': 'integer',
+  'test[].field_d.nested_d[].d_a': 'string',
+  'test[].field_d.nested_d[].d_b': 'boolean',
+  'test[].field_d.nested_d[].d_c': 'integer',
+  'test[].field_d.nested_d[].d_d': 'double'
+}
+print(json.dumps(create_sample(test_dict)))
+```
+Output
+```json
+{
+  "test": [
+    {
+      "field_a": "",
+      "field_b": true,
+      "field_c": 0,
+      "field_d": {
+        "nested_d": [
+          {
+            "d_a": "",
+            "d_b": true,
+            "d_c": 0,
+            "d_d": 0.1
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+Great, two definitions are the same for us to generate the PySpark type as before.
+
+Moreover, the definition dictionary can be managed as a CSV file, with 1 column for Json Paths, and one column for the data type. We can just get the dictionary from the CSV sheet
+
+```python
+def schema_sheet2dict(df, json_path_col, type_col):
+  schema_types = df.select(F.col(json_path_col).alias('JsonPath'), F.col(type_col).alias('DataType')).where('JsonPath is not Null')
+  pd_types = schema_types.toPandas()
+  return dict(zip(pd_types.JsonPath, pd_types.DataType))
+```
+
+So, we could help to manage the data schema with CSV sheet. The helpers could help to generate the PySpark schema from it:
+
+```
+Definition Sheet -> Dictionary -> Json sample -> PySpark types
+```
+
+## More UnitTesting
+
+We can enable more UnitTesting and schema validation with the above chain.
+We add here a helper for re-generating the data dictionary from PySpark type
+
+```python
+def type2dict(data_type):
+  def get_simple_type(data_type):
+    return data_type[:-6].lower()
+
+  def type_to_dict(data_type, current_path):
+
+    if type(data_type) == T.StructType:
+      children = [type_to_dict(f.dataType, f'{current_path}.{f.name}') for f in data_type.fields]
+      ret = {}
+      for child in children:
+        for e in child:
+          ret[e] = child[e]
+      return ret
+    elif type(data_type) == T.ArrayType:
+      children = type_to_dict(data_type.elementType, f'{current_path}[]')
+      return children
+    else:
+      return {current_path: get_simple_type(data_type.__repr__())}
+  
+  type_dict = type_to_dict(data_type, '')
+  return {e[1:]: type_dict[e] for e in type_dict}
+
+```
+
+This helper execution
+
+```python
+test_schema = T.StructType([
+  T.StructField("test", T.ArrayType(T.StructType([
+      T.StructField("field_a", T.StringType(), True),
+      T.StructField("field_b", T.BooleanType(), True),
+      T.StructField("field_c", T.LongType(), True),
+      T.StructField("field_d", T.StructType([
+        T.StructField("nested_d", T.ArrayType(T.StructType([
+            T.StructField("d_a", T.StringType(), True),
+            T.StructField("d_b", T.BooleanType(), True),
+            T.StructField("d_c", T.LongType(), True),
+            T.StructField("d_d", T.DoubleType(), True)
+          ]), True), True)
+      ]), True)
+    ]), True), True)
+])
+
+print(type2dict(test_schema))
+```
+ouputs
+```
+{
+  'test[].field_a': 'string',
+  'test[].field_b': 'boolean',
+  'test[].field_c': 'long',
+  'test[].field_d.nested_d[].d_a': 'string',
+  'test[].field_d.nested_d[].d_b': 'boolean',
+  'test[].field_d.nested_d[].d_c': 'long',
+  'test[].field_d.nested_d[].d_d': 'double'
+}
+```
+
+Well now, we can make a round: data dictionary -> PySpark type -> data dictionary to test the schema.
+
+Moreover, the data dictionary can help us to track the evolution of the schema. For example, if we have an existing schema definition. The business guys come with a new version, adding more data fiedls to the schema. We can make
+```
+old schema -> old data dictionary
+new dictionary -> new schema -> new data dictionary
+```
+and compary the 2 data dictionary to track what are the added/changed/deleted data fields.
+
+```python
+def schema_dict_changes(old_dict, new_dict):
+  deleted = []
+  added = []
+  changed = []
+  for elem in old_dict:
+    if not elem in new_dict:
+      deleted.append((elem, old_dict[elem]))
+    elif old_dict[elem] != new_dict[elem]:
+      changed.append((elem, (old_dict[elem], new_dict[elem])))
+
+  for elem in new_dict:
+    if not elem in old_dict:
+      added.append((elem, new_dict[elem]))
+  
+  return deleted, changed, added
+```
